@@ -5,25 +5,26 @@ use std::io::{self, Write};
 use std::fs::File;
 use serde_json;
 use ureq;
+use std::process::Command;
 
-// Response struct for transcript
-#[derive(Debug, Deserialize)]
-struct TranscriptResponse {
-    text: String,
-}
-
-// Config struct for reading token
+// struct to read config file for HF token
 #[derive(Debug, Deserialize)]
 struct Config {
     token: String,
 }
 
-// Main summary struct
+// main struct for summary
 #[derive(Debug, Serialize, Deserialize)]
 struct Summary {
     video_id: Option<String>,
     transcript: Option<String>,
     summary: Option<String>,
+}
+
+// struct to store api response from HF transformer model
+#[derive(Debug, Deserialize)]
+struct ApiResponse {
+    summary_text: String,
 }
 
 struct HuggingFaceSummarizer {
@@ -47,30 +48,28 @@ impl HuggingFaceSummarizer {
     }
 
     fn get_transcript(video_id: &str) -> Result<String> {
-        let url = format!(
-            "url",
-            video_id
-        );
+        println!("Fetching transcript for video ID: {}", video_id);
         
-        println!("Fetching transcript from: {}", url);
-        
-        let response = ureq::get(&url)
-            .call()
-            .context("Failed to fetch transcript")?;
-        
-        // Print the raw response for debugging
-        let response_text = response.into_string()?;
-        println!("Raw API Response: {}", response_text);
-        
-        // Try to parse the response
-        let transcript_entries: Vec<TranscriptResponse> = serde_json::from_str(&response_text)
-            .context(format!("Failed to parse transcript JSON: {}", response_text))?;
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(format!(
+                "from youtube_transcript_api import YouTubeTranscriptApi; \
+                 transcript = YouTubeTranscriptApi.get_transcript('{}'); \
+                 print(' '.join(entry['text'] for entry in transcript))",
+                video_id
+            ))
+            .output()
+            .context("Failed to execute python command. Make sure python3 and youtube_transcript_api are installed")?;
 
-        Ok(transcript_entries
-            .into_iter()
-            .map(|entry| entry.text)
-            .collect::<Vec<String>>()
-            .join(" "))
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("Failed to get transcript: {}", error));
+        }
+
+        let transcript = String::from_utf8(output.stdout)
+            .context("Failed to parse transcript output")?;
+
+        Ok(transcript)
     }
 
     fn chunk_text(text: &str, max_length: usize) -> Vec<String> {
@@ -102,8 +101,12 @@ impl HuggingFaceSummarizer {
     fn summarize_text(&self, text: &str) -> Result<String> {
         let chunks = Self::chunk_text(text, 1024);
         let mut summaries = Vec::new();
+        
+        println!("Processing {} chunks...", chunks.len());
 
-        for chunk in chunks {
+        for (i, chunk) in chunks.iter().enumerate() {
+            println!("Summarizing chunk {}/{}...", i + 1, chunks.len());
+            
             let response = ureq::post(&self.api_url)
                 .set("Authorization", &format!("Bearer {}", self.api_token))
                 .send_json(ureq::json!({
@@ -113,18 +116,23 @@ impl HuggingFaceSummarizer {
                         "min_length": 30,
                         "do_sample": false
                     }
-                }))?;
+                }))
+                .context("Failed to send request to API")?;
 
-            let summary: Vec<String> = response.into_json()?;
+            let summary: Vec<ApiResponse> = response.into_json()
+                .context("Failed to parse API response")?;
+            
             if let Some(first_summary) = summary.first() {
-                summaries.push(first_summary.clone());
+                summaries.push(first_summary.summary_text.clone());
             }
         }
 
-        summaries
-            .first()
-            .cloned()
-            .context("No summary generated")
+        if summaries.is_empty() {
+            return Err(anyhow::anyhow!("No summaries were generated"));
+        }
+
+        // Join all summaries with newlines between them
+        Ok(summaries.join("\n\n"))
     }
 
     fn process_video(&self, youtube_url: &str) -> Result<Summary> {
@@ -139,12 +147,10 @@ impl HuggingFaceSummarizer {
             summary: None,
         };
 
-        let transcript = Self::get_transcript(&video_id)
-            .context("Failed to fetch transcript")?;
+        let transcript = Self::get_transcript(&video_id)?;
         result.transcript = Some(transcript.clone());
         
-        let summary = self.summarize_text(&transcript)
-            .context("Failed to generate summary")?;
+        let summary = self.summarize_text(&transcript)?;
         result.summary = Some(summary);
 
         Ok(result)
@@ -185,7 +191,7 @@ fn main() -> Result<()> {
                 println!("Failed to generate summary");
             }
         }
-        Err(e) => println!("Error: {}", e),
+        Err(e) => println!("Error: {:#}", e),
     }
 
     Ok(())

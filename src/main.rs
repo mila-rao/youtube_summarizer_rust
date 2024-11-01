@@ -168,7 +168,7 @@ fn read_config(path: &str) -> Result<String> {
 }
 
 fn main() -> Result<()> {
-    let config_path = "config.json";
+    let config_path = "config.json"; //path to Hugging Face Access token here
     
     let api_token = read_config(config_path)
         .context("Failed to read API token from config")?;
